@@ -22,7 +22,7 @@ test("chatToResponsesPayload converts system and developer messages into instruc
     { role: "assistant", content: "Hi" }
   ]);
   assert.equal(payload.stream, false);
-  assert.equal(payload.temperature, 0.8);
+  assert.equal(payload.temperature, undefined, "the Codex backend rejects temperature");
 });
 
 test("chatToResponsesPayload preserves structured file content", () => {
@@ -105,7 +105,7 @@ test("responsesToChatCompletion returns OpenAI-compatible shape", () => {
       finish_reason: "stop"
     }
   ]);
-  assert.deepEqual(completion.usage, { input_tokens: 1 });
+  assert.deepEqual(completion.usage, { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 });
 });
 
 test("chatToResponsesPayload translates reasoning_effort into reasoning.effort", () => {
@@ -130,30 +130,18 @@ test("chatToResponsesPayload merges reasoning_effort into an existing reasoning 
   assert.deepEqual(payload.reasoning, { summary: "auto", effort: "low" });
 });
 
-test("chatToResponsesPayload translates max_tokens into max_output_tokens", () => {
+test("chatToResponsesPayload drops token limits the Codex backend rejects", () => {
   const payload = chatToResponsesPayload({
     model: "gpt-5.5",
     messages: [{ role: "user", content: "Hi" }],
-    max_tokens: 128
-  });
-
-  assert.equal(payload.max_output_tokens, 128);
-  assert.equal(payload.max_tokens, undefined);
-
-  const aliased = chatToResponsesPayload({
-    model: "gpt-5.5",
-    messages: [{ role: "user", content: "Hi" }],
-    max_completion_tokens: 64
-  });
-  assert.equal(aliased.max_output_tokens, 64);
-
-  const explicit = chatToResponsesPayload({
-    model: "gpt-5.5",
-    messages: [{ role: "user", content: "Hi" }],
     max_tokens: 128,
+    max_completion_tokens: 64,
     max_output_tokens: 32
   });
-  assert.equal(explicit.max_output_tokens, 32);
+
+  assert.equal(payload.max_tokens, undefined);
+  assert.equal(payload.max_completion_tokens, undefined);
+  assert.equal(payload.max_output_tokens, undefined);
 });
 
 test("chatToResponsesPayload drops fields the Codex backend rejects", () => {
@@ -174,22 +162,28 @@ test("chatToResponsesPayload drops fields the Codex backend rejects", () => {
   }
 });
 
-test("chatToResponsesPayload forwards accepted Responses fields verbatim", () => {
+test("chatToResponsesPayload forwards only Responses fields that reach the Codex backend", () => {
   const payload = chatToResponsesPayload({
     model: "gpt-5.5",
     messages: [{ role: "user", content: "Hi" }],
-    temperature: 0.3,
-    store: false,
-    metadata: { trace: "1" },
+    reasoning: { summary: "auto" },
     parallel_tool_calls: false,
-    prompt_cache_key: "abc"
+    prompt_cache_key: "abc",
+    truncation: "auto",
+    include: ["reasoning.encrypted_content"],
+    temperature: 0.3,
+    store: true,
+    metadata: { trace: "1" }
   });
 
-  assert.equal(payload.temperature, 0.3);
-  assert.equal(payload.store, false);
-  assert.deepEqual(payload.metadata, { trace: "1" });
+  assert.deepEqual(payload.reasoning, { summary: "auto" });
   assert.equal(payload.parallel_tool_calls, false);
   assert.equal(payload.prompt_cache_key, "abc");
+  assert.equal(payload.truncation, "auto");
+  assert.deepEqual(payload.include, ["reasoning.encrypted_content"]);
+  for (const field of ["temperature", "store", "metadata"]) {
+    assert.equal(payload[field], undefined, `${field} should be dropped`);
+  }
 });
 
 test("chatToResponsesPayload translates chat function tools into Responses tools", () => {

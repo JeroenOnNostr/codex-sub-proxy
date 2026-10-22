@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { HttpError } from "./http.js";
+import { HttpError, isPlainObject } from "./http.js";
 
 export interface ChatMessage {
   role: string;
@@ -45,16 +45,14 @@ export interface ResponseFunctionCallOutput {
   output: string;
 }
 
-// Responses-API fields that the Codex backend accepts and that are safe to
-// forward verbatim from a chat.completions request. Anything not listed here
-// (or translated explicitly below) is dropped: the Codex backend rejects
-// unknown top-level fields with a 400.
+// Responses fields that are forwarded verbatim from a chat.completions request.
+// Everything else is either translated below or dropped, because the Codex
+// backend rejects unknown top-level fields with a 400. Fields the backend
+// rejects even though they are valid Responses fields (temperature,
+// max_output_tokens, metadata, ...) are removed later by stripUnsupportedParams,
+// so they are deliberately not listed here.
 const RESPONSES_PASSTHROUGH_FIELDS = [
-  "temperature",
-  "max_output_tokens",
   "reasoning",
-  "store",
-  "metadata",
   "parallel_tool_calls",
   "prompt_cache_key",
   "truncation",
@@ -97,8 +95,7 @@ export function chatToResponsesPayload(request: ChatCompletionRequest): Response
     if (message.role === "assistant") {
       const content = normalizeContent(message.content);
       const toolCalls = parseChatToolCalls(message.tool_calls);
-      const hasContent = typeof content === "string" ? content.length > 0 : content.length > 0;
-      if (hasContent || toolCalls.length === 0) {
+      if (content.length > 0 || toolCalls.length === 0) {
         input.push({ role: message.role, content });
       }
       input.push(...toolCalls);
@@ -117,17 +114,6 @@ export function chatToResponsesPayload(request: ChatCompletionRequest): Response
     throw new HttpError(400, "invalid_request", `Unsupported chat message role: ${message.role}`);
   }
 
-  const {
-    messages: _messages,
-    reasoning_effort: reasoningEffort,
-    max_tokens: chatMaxTokens,
-    max_completion_tokens: chatMaxCompletionTokens,
-    stream_options: _streamOptions,
-    tools: chatTools,
-    tool_choice: chatToolChoice,
-    ...rest
-  } = request;
-
   const payload: ResponsesPayload = {
     model: request.model,
     instructions: instructions.length > 0 ? instructions.join("\n\n") : undefined,
@@ -136,40 +122,73 @@ export function chatToResponsesPayload(request: ChatCompletionRequest): Response
   };
 
   for (const field of RESPONSES_PASSTHROUGH_FIELDS) {
-    const value = rest[field];
+    const value = request[field];
     if (value !== undefined) payload[field] = value;
   }
 
-  const maxOutputTokens = firstNumber(chatMaxTokens, chatMaxCompletionTokens);
-  if (maxOutputTokens !== undefined && payload.max_output_tokens == null) {
-    payload.max_output_tokens = maxOutputTokens;
-  }
-
-  if (typeof reasoningEffort === "string") {
-    const reasoning = isPlainObject(payload.reasoning) ? { ...(payload.reasoning as Record<string, unknown>) } : {};
-    reasoning.effort = reasoningEffort;
+  if (typeof request.reasoning_effort === "string") {
+    const reasoning = isPlainObject(payload.reasoning) ? { ...payload.reasoning } : {};
+    reasoning.effort = request.reasoning_effort;
     payload.reasoning = reasoning;
   }
 
-  if (chatTools !== undefined) {
-    payload.tools = parseChatTools(chatTools);
+  const text = buildTextOptions(request);
+  if (text) payload.text = text;
+
+  if (request.tools !== undefined) {
+    payload.tools = parseChatTools(request.tools);
   }
-  if (chatToolChoice !== undefined) {
-    payload.tool_choice = normalizeChatToolChoice(chatToolChoice);
+  if (request.tool_choice !== undefined) {
+    payload.tool_choice = normalizeChatToolChoice(request.tool_choice);
   }
 
   return applyChatWebSearchOptions(payload);
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+// Chat `response_format` and `verbosity` live under `text` in the Responses API.
+function buildTextOptions(request: ChatCompletionRequest): Record<string, unknown> | undefined {
+  if (request.text !== undefined && !isPlainObject(request.text)) {
+    throw new HttpError(400, "invalid_request", "text must be an object");
+  }
+
+  const text: Record<string, unknown> = isPlainObject(request.text) ? { ...request.text } : {};
+
+  if (request.response_format !== undefined) {
+    text.format = chatResponseFormatToTextFormat(request.response_format);
+  }
+
+  if (request.verbosity !== undefined) {
+    if (typeof request.verbosity !== "string") {
+      throw new HttpError(400, "invalid_request", "verbosity must be a string");
+    }
+    text.verbosity = request.verbosity;
+  }
+
+  return Object.keys(text).length > 0 ? text : undefined;
 }
 
-function firstNumber(...values: unknown[]): number | undefined {
-  for (const value of values) {
-    if (typeof value === "number" && Number.isFinite(value)) return value;
+function chatResponseFormatToTextFormat(format: unknown): Record<string, unknown> {
+  if (!isPlainObject(format)) {
+    throw new HttpError(400, "invalid_request", "response_format must be an object");
   }
-  return undefined;
+
+  if (format.type === "text" || format.type === "json_object") {
+    return { type: format.type };
+  }
+
+  if (format.type === "json_schema") {
+    const schema = format.json_schema;
+    if (!isPlainObject(schema) || typeof schema.name !== "string" || !schema.name) {
+      throw new HttpError(400, "invalid_request", "response_format.json_schema.name is required");
+    }
+    const textFormat: Record<string, unknown> = { type: "json_schema", name: schema.name };
+    if (schema.schema !== undefined) textFormat.schema = schema.schema;
+    if (typeof schema.description === "string") textFormat.description = schema.description;
+    if (typeof schema.strict === "boolean") textFormat.strict = schema.strict;
+    return textFormat;
+  }
+
+  throw new HttpError(400, "invalid_request", `Unsupported response_format type: ${String(format.type)}`);
 }
 
 function parseChatToolCalls(toolCalls: unknown): ResponseFunctionCall[] {
@@ -340,10 +359,10 @@ export function responsesToChatCompletion(response: unknown, model: string): Rec
       {
         index: 0,
         message,
-        finish_reason: toolCalls.length > 0 ? "tool_calls" : extractFinishReason(response)
+        finish_reason: chatFinishReason(response, toolCalls.length > 0)
       }
     ],
-    usage: extractUsage(response)
+    usage: toChatUsage(isPlainObject(response) ? response.usage : undefined)
   };
 }
 
@@ -353,70 +372,88 @@ interface AssistantParts {
 }
 
 function extractAssistantParts(response: unknown): AssistantParts {
-  if (!response || typeof response !== "object") return { text: "", toolCalls: [] };
-  const object = response as Record<string, unknown>;
+  if (!isPlainObject(response)) return { text: "", toolCalls: [] };
 
   const toolCalls: Record<string, unknown>[] = [];
   const parts: string[] = [];
 
-  const output = object.output;
-  if (Array.isArray(output)) {
-    for (const item of output) {
-      if (!item || typeof item !== "object") continue;
-      const itemObject = item as Record<string, unknown>;
+  const output = Array.isArray(response.output) ? response.output : [];
+  for (const item of output) {
+    if (!isPlainObject(item)) continue;
 
-      if (itemObject.type === "function_call") {
-        toolCalls.push({
-          id:
-            typeof itemObject.call_id === "string"
-              ? itemObject.call_id
-              : typeof itemObject.id === "string"
-                ? itemObject.id
-                : randomUUID(),
-          type: "function",
-          function: {
-            name: typeof itemObject.name === "string" ? itemObject.name : "",
-            arguments:
-              typeof itemObject.arguments === "string"
-                ? itemObject.arguments
-                : JSON.stringify(itemObject.arguments ?? {})
-          }
-        });
-        continue;
-      }
+    if (item.type === "function_call") {
+      toolCalls.push({
+        id: toolCallId(item),
+        type: "function",
+        function: {
+          name: typeof item.name === "string" ? item.name : "",
+          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
+        }
+      });
+      continue;
+    }
 
-      const content = itemObject.content;
-      if (!Array.isArray(content)) continue;
-      for (const part of content) {
-        if (!part || typeof part !== "object") continue;
-        const text = (part as Record<string, unknown>).text;
-        if (typeof text === "string") parts.push(text);
-      }
+    // Only assistant message text is content; reasoning items also carry text parts.
+    if (item.type !== undefined && item.type !== "message") continue;
+    if (!Array.isArray(item.content)) continue;
+    for (const part of item.content) {
+      if (!isPlainObject(part)) continue;
+      if (part.type !== undefined && part.type !== "output_text" && part.type !== "text") continue;
+      if (typeof part.text === "string") parts.push(part.text);
     }
   }
 
-  // The Codex backend echoes function-call arguments into the top-level
-  // output_text convenience field; only trust it for text-only responses.
-  if (toolCalls.length === 0 && typeof object.output_text === "string") {
-    return { text: object.output_text, toolCalls };
-  }
-
-  return { text: parts.join(""), toolCalls };
+  const text = typeof response.output_text === "string" ? response.output_text : parts.join("");
+  return { text, toolCalls };
 }
 
 export function extractOutputText(response: unknown): string {
   return extractAssistantParts(response).text;
 }
 
-function extractFinishReason(response: unknown): string {
-  if (!response || typeof response !== "object") return "stop";
-  const status = (response as Record<string, unknown>).status;
-  return status === "incomplete" ? "length" : "stop";
+export function toolCallId(item: Record<string, unknown>): string {
+  if (typeof item.call_id === "string") return item.call_id;
+  if (typeof item.id === "string") return item.id;
+  return `call_${randomUUID().replaceAll("-", "")}`;
 }
 
-function extractUsage(response: unknown): unknown {
-  if (!response || typeof response !== "object") return undefined;
-  return (response as Record<string, unknown>).usage;
+// A truncated response reports "length" even when it contains tool calls,
+// because the last call's arguments may be cut off.
+export function chatFinishReason(response: unknown, hasToolCalls: boolean): string {
+  if (isPlainObject(response) && response.status === "incomplete") {
+    const details = response.incomplete_details;
+    return isPlainObject(details) && details.reason === "content_filter" ? "content_filter" : "length";
+  }
+  return hasToolCalls ? "tool_calls" : "stop";
+}
+
+// Convert Responses usage (input/output tokens) into Chat Completions usage
+// (prompt/completion tokens).
+export function toChatUsage(usage: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(usage)) return undefined;
+
+  const promptTokens = tokenCount(usage.input_tokens ?? usage.prompt_tokens);
+  const completionTokens = tokenCount(usage.output_tokens ?? usage.completion_tokens);
+  const chatUsage: Record<string, unknown> = {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: typeof usage.total_tokens === "number" ? usage.total_tokens : promptTokens + completionTokens
+  };
+
+  const inputDetails = usage.input_tokens_details;
+  if (isPlainObject(inputDetails) && typeof inputDetails.cached_tokens === "number") {
+    chatUsage.prompt_tokens_details = { cached_tokens: inputDetails.cached_tokens };
+  }
+  const outputDetails = usage.output_tokens_details;
+  if (isPlainObject(outputDetails) && typeof outputDetails.reasoning_tokens === "number") {
+    chatUsage.completion_tokens_details = { reasoning_tokens: outputDetails.reasoning_tokens };
+  }
+
+  return chatUsage;
+}
+
+function tokenCount(value: unknown): number {
+  return typeof value === "number" ? value : 0;
 }
 
 function parseChatMessage(value: unknown): ChatMessage {
